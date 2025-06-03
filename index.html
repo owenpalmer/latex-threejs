@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Interactive 3‑D LaTeX Viewer</title>
+    <style>
+        * {
+            box-sizing: border-box
+        }
+
+        body {
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            font-family: system-ui, sans-serif;
+            background: #fafafa
+        }
+
+        /* Input bar */
+        #input-bar {
+            padding: 12px 0;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
+            background: #ffffff;
+            z-index: 5;
+            display: flex;
+            flex-direction: column;
+            align-items: center
+        }
+
+        #input-wrap {
+            display: flex;
+            gap: 8px;
+            align-items: center
+        }
+
+        #latex-input {
+            width: 60vw;
+            max-width: 640px;
+            font-size: 18px;
+            padding: 6px 12px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            outline: none;
+            transition: border .2s
+        }
+
+        #latex-input.error {
+            border-color: #d33
+        }
+
+        #render-btn {
+            padding: 7px 18px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            background: #156289;
+            color: #fff;
+            cursor: pointer;
+            transition: background .2s
+        }
+
+        #render-btn:hover {
+            background: #1d7fb1
+        }
+
+        #error-msg {
+            color: #d33;
+            font-size: 14px;
+            height: 18px;
+            margin-top: 4px;
+        }
+
+        /* Three.js viewport */
+        #three-container {
+            flex: 1 1 auto;
+            position: relative
+        }
+
+        canvas {
+            display: block
+        }
+    </style>
+
+    <!-- MathJax v3 -->
+    <script>
+        window.MathJax = { tex: { inlineMath: [["$", "$"], ["\\(", "\\)"]] }, svg: { fontCache: 'none' }, startup: { typeset: false } };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+
+    <!-- Import map for Three.js ESM -->
+    <script type="importmap">
+  { "imports": { "three": "https://unpkg.com/three@0.177.0/build/three.module.js" } }
+  </script>
+</head>
+
+<body>
+    <!-- Input bar -->
+    <div id="input-bar">
+        <div id="input-wrap">
+            <input id="latex-input" placeholder="Enter LaTeX…" />
+            <button id="render-btn">Render</button>
+        </div>
+        <div id="error-msg"></div>
+    </div>
+
+    <!-- Three.js viewport -->
+    <section id="three-container"></section>
+
+    <!-- Hidden staging element for MathJax SVG output -->
+    <div id="mathjax-hidden" style="visibility:hidden;position:absolute;top:-9999px;"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'https://unpkg.com/three@0.177.0/examples/jsm/controls/OrbitControls.js';
+        import { SVGLoader } from 'https://unpkg.com/three@0.177.0/examples/jsm/loaders/SVGLoader.js';
+
+        /* ───── Smooth camera tween ───── */
+        let camTween = null;
+        function startCamTween(fromPos, toPos, fromTarget, toTarget, dur = 700) {
+            camTween = { fromPos, toPos, fromTarget, toTarget, start: performance.now(), dur, enabledDamping: controls.enableDamping };
+            controls.enableDamping = false;
+        }
+        function updateCamTween() {
+            if (!camTween) return;
+            const elapsed = performance.now() - camTween.start;
+            let t = elapsed / camTween.dur;
+            if (t >= 1) {
+                camera.position.copy(camTween.toPos);
+                controls.target.copy(camTween.toTarget);
+                controls.enableDamping = camTween.enabledDamping;
+                camTween = null;
+                controls.update();
+                return;
+            }
+            t = t < .5 ? 2 * t * t : (-1 + (4 - 2 * t) * t);
+            camera.position.lerpVectors(camTween.fromPos, camTween.toPos, t);
+            controls.target.lerpVectors(camTween.fromTarget, camTween.toTarget, t);
+            controls.update();
+        }
+
+        /* ───── Convert LaTeX → 3‑D mesh ───── */
+        async function latexToMesh(latex) {
+            if (window.MathJax?.startup?.promise) await MathJax.startup.promise;
+            const hidden = document.getElementById('mathjax-hidden'); hidden.innerHTML = '';
+            const wrap = document.createElement('div'); wrap.innerHTML = `\\(${latex}\\)`;
+            hidden.appendChild(wrap);
+            await MathJax.typesetPromise([wrap]);
+            const svg = wrap.querySelector('svg'); if (!svg) throw new Error('Invalid LaTeX');
+            let markup = new XMLSerializer().serializeToString(svg).replace(/currentColor/g, '#000000');
+            const { paths } = new SVGLoader().parse(markup);
+            const depth = 8, mat = new THREE.MeshPhongMaterial({ color: 0x156289, specular: 0x111111, shininess: 90 });
+            const group = new THREE.Group();
+            for (const p of paths) { for (const s of SVGLoader.createShapes(p)) group.add(new THREE.Mesh(new THREE.ExtrudeGeometry(s, { depth, bevelEnabled: false }), mat)); }
+            group.rotateX(Math.PI);
+
+            // Get bounding box and calculate scale first
+            const box = new THREE.Box3().setFromObject(group);
+            const size = new THREE.Vector3(); box.getSize(size);
+            const scale = 60 / size.y;
+
+            // Apply scale first
+            group.scale.setScalar(scale);
+
+            // Now get the scaled bounding box and center it properly
+            const scaledBox = new THREE.Box3().setFromObject(group);
+            const scaledCenter = new THREE.Vector3(); scaledBox.getCenter(scaledCenter);
+
+            // Center the mesh by moving it so its geometric center is at world origin
+            group.position.sub(scaledCenter);
+
+            return group;
+        }
+
+        /* ───── Three.js setup ───── */
+        const container = document.getElementById('three-container');
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        container.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene(); scene.background = new THREE.Color(0xf0f0f0);
+        const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 2000);
+        camera.position.set(0, 0, 150);
+        const controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true;
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+        const light = new THREE.DirectionalLight(0xffffff, 0.9); light.position.set(15, 25, 40); scene.add(light);
+
+        /* ───── Camera fit: immediate or tween ───── */
+        let firstRender = true;
+        function fitCameraImmediate(object, padding = 1.25) {
+            const box = new THREE.Box3().setFromObject(object);
+            const size = new THREE.Vector3(); box.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = THREE.MathUtils.degToRad(camera.fov);
+            const dist = (maxDim / 2) / Math.tan(fov / 2) * padding;
+            const target = new THREE.Vector3(0, 0, 0); // Always target world origin
+            camera.position.copy(target.clone().add(new THREE.Vector3(0, 0, dist)));
+            controls.target.copy(target);
+            camera.near = Math.max(dist / 10, 0.1); camera.far = dist * 10; camera.updateProjectionMatrix();
+            controls.update();
+        }
+        function panZoomToFit(object, padding = 1.25) {
+            controls.update();
+            const oldPos = camera.position.clone();
+            const oldTarget = controls.target.clone();
+            const oldDir = oldPos.clone().sub(oldTarget);
+            const oldDist = oldDir.length(); if (oldDist < 1e-6) oldDir.set(0, 0, 1);
+
+            // Calculate required distance for new object
+            const box = new THREE.Box3().setFromObject(object);
+            const size = new THREE.Vector3(); box.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = THREE.MathUtils.degToRad(camera.fov);
+            const newDist = (maxDim / 2) / Math.tan(fov / 2) * padding;
+
+            // New target is always world origin since all meshes are positioned there
+            const newTarget = new THREE.Vector3(0, 0, 0);
+
+            // Maintain the current viewing direction but adjust distance
+            const viewDir = oldDir.clone().normalize();
+            const newPos = newTarget.clone().add(viewDir.multiplyScalar(newDist));
+
+            startCamTween(oldPos, newPos, oldTarget, newTarget);
+            camera.near = Math.max(newDist / 10, 0.1); camera.far = newDist * 10; camera.updateProjectionMatrix();
+        }
+
+        /* ───── Interaction ───── */
+        const input = document.getElementById('latex-input');
+        const renderBtn = document.getElementById('render-btn');
+        const errorMsg = document.getElementById('error-msg');
+        input.value = '\\int_0^{\\infty} e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}';
+
+        let glyph = null;
+        async function renderLatex() {
+            const tex = input.value.trim(); if (!tex) return;
+            input.classList.remove('error'); errorMsg.textContent = '';
+            try {
+                const mesh = await latexToMesh(tex);
+                if (glyph) scene.remove(glyph);
+                glyph = mesh; scene.add(glyph);
+                if (firstRender) { fitCameraImmediate(glyph); firstRender = false; }
+                else { panZoomToFit(glyph); }
+            } catch (e) { console.error(e); input.classList.add('error'); errorMsg.textContent = 'Invalid LaTeX expression'; }
+        }
+
+        input.addEventListener('keydown', e => { if (e.key === 'Enter') renderLatex(); });
+        renderBtn.addEventListener('click', renderLatex);
+
+        // Initial render
+        renderLatex();
+
+        window.addEventListener('resize', () => {
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            camera.aspect = container.clientWidth / container.clientHeight; camera.updateProjectionMatrix();
+        });
+
+        /* ───── Render loop ───── */
+        (function animate() {
+            requestAnimationFrame(animate);
+            updateCamTween();
+            controls.update();
+            renderer.render(scene, camera);
+        })();
+    </script>
+</body>
+
+</html>
